@@ -594,7 +594,13 @@ function saveRoomKey(code, key) {
   localStorage.setItem(ROOM_KEY_STORE, JSON.stringify(store));
 }
 
-state.room = null; // { view, session, key, anchor:{wall,time,speed,playing}, pollTimer, rafId }
+state.room = null; // { view, session, key, anchor:{wall,time,speed,playing}, pollTimer, rafId, progRows }
+
+// 循环排演编辑器的段行（主持人本地草稿，未提交不影响房间）
+function defaultProgRow() {
+  const max = state.room ? state.room.view.duration : 0;
+  return { start: 0, end: Math.max(0, Math.min(10, max)), repeat: 1 };
+}
 
 function renderRoomVersionOptions() {
   const sel = $('room-create-version');
@@ -670,6 +676,8 @@ async function enterRoom(code, key, initialView) {
     issuedIssuedAt: null,
     // 本浏览器领取交接后取得的新密钥提示（仅显示一次，可手动关闭）
     claimedKey: null,
+    // 循环排演编辑器的本地段行草稿
+    progRows: null,
     session: {
       id: snap.id,
       label: snap.label,
@@ -679,6 +687,9 @@ async function enterRoom(code, key, initialView) {
     },
   };
   applyRoomAnchor(view);
+
+  // 重置编排编辑器：进入新房间时强制按本房间草稿重建表格
+  $('room-program-table').querySelector('tbody').dataset.rows = '';
 
   $('room-lobby').hidden = true;
   $('room-workspace').hidden = false;
@@ -695,6 +706,7 @@ async function enterRoom(code, key, initialView) {
   renderRoom();
   renderRoomProtection();
   renderRoomHandover();
+  renderRoomProgram();
 
   document.querySelector('.tab[data-tab="room"]').click();
 }
@@ -709,13 +721,41 @@ function applyRoomAnchor(view) {
   };
 }
 
+// 循环排演：把“线性目标时码”映射为编排中的真实演出时码（与服务端同一份纯函数）。
+// 观看端只拿到最近一次同步的段/轮/时码锚点；本地用墙钟外推。
+function roomProgramProjection(view, targetLinear) {
+  const p = view.program;
+  if (!p || p.finished) return { time: view.server_time, segIndex: p ? p.segment_index - 1 : 0, iteration: p ? p.loop - 1 : 0, finished: !!p };
+  const r = window.LightingProgram.advanceProgram(
+    {
+      segIndex: p.segment_index - 1,
+      iteration: p.loop - 1,
+      time: view.server_time,
+      finished: false,
+    },
+    p.segments,
+    targetLinear,
+    null
+  );
+  return { time: r.time, segIndex: r.segIndex, iteration: r.iteration, finished: r.finished };
+}
+
 // 当前按服务端锚点推算出的本地时码；到末尾自动停住（与服务端同规则）
 function roomCurrentTime(nowSec) {
   const r = state.room;
   const a = r.anchor;
   if (!a.playing) return Math.min(a.time, r.view.duration);
-  let t = a.time + Math.max(0, nowSec - a.wall) * a.speed;
-  t = Math.min(t, r.view.duration);
+  let linear = a.time + Math.max(0, nowSec - a.wall) * a.speed;
+  if (r.view.program && !r.view.program.finished) {
+    // 循环排演：线性目标 -> 段/轮/时码映射
+    const proj = roomProgramProjection(r.view, linear);
+    let t = proj.time;
+    // 超载保护：本地外推同样不越过前方首个超载边界（下次轮询由服务端纠正）
+    const p = r.view.protection;
+    if (p && p.enabled && p.next_trip && t > p.next_trip.time) t = p.next_trip.time;
+    return t;
+  }
+  let t = Math.min(linear, r.view.duration);
   // 超载保护：即使观看端轮询间隔较长，两次同步之间也不越过前方首个超载边界
   // （服务端会在该边界自动暂停，下一次轮询即把锚点校正为暂停在边界）
   const p = r.view.protection;
@@ -753,6 +793,7 @@ async function pollRoom() {
     renderRoomRole();
     renderRoomProtection();
     renderRoomHandover();
+    renderRoomProgram();
     updateRoomHandoverCountdown();
   } catch {
     /* 单次轮询失败不打断观看：下一周期重试 */
@@ -800,6 +841,7 @@ async function roomControl(action, extra = {}) {
     renderRoomRole();
     renderRoomProtection();
     renderRoomHandover();
+    renderRoomProgram();
   } catch (err2) {
     if (err2.status === 409) {
       await pollRoom(); // 过期：按服务端最新状态校时后提示重试
@@ -814,18 +856,33 @@ async function roomControl(action, extra = {}) {
     }
     renderRoomRole();
     renderRoomHandover();
+    renderRoomProgram();
     showErr($('room-error'), `控制失败：${err2.message}`);
   }
 }
 
 $('btn-room-play').addEventListener('click', () => roomControl('play'));
 $('btn-room-pause').addEventListener('click', () => roomControl('pause'));
-$('btn-room-stop').addEventListener('click', () => roomControl('pause').then(() => roomControl('seek', { time: 0 })));
+$('btn-room-stop').addEventListener('click', async () => {
+  // 回到起点本质是一次手动跳转：若正在循环排演，会取消编排
+  const r0 = state.room;
+  if (r0 && r0.key && r0.view.program &&
+      !window.confirm('回到起点是手动跳转，将取消当前循环排演并回到普通房间。确定继续？')) {
+    return;
+  }
+  await roomControl('pause');
+  await roomControl('seek', { time: 0 });
+});
 $('btn-room-jump').addEventListener('click', () => {
   const raw = $('room-jump-time').value;
   const t = Number(raw);
   if (!Number.isFinite(t)) return showErr($('room-error'), '跳转时刻必须是数字。');
   if (t < 0) return showErr($('room-error'), `非法时码：${raw}（不得为负）。`);
+  const r0 = state.room;
+  if (r0 && r0.key && r0.view.program &&
+      !window.confirm('手动跳转会取消当前循环排演，并沿用普通房间控制语义。确定跳转到 ' + fmt(t) + ' 秒？')) {
+    return;
+  }
   roomControl('seek', { time: t });
 });
 $('room-speed').addEventListener('change', (e) => {
@@ -861,8 +918,201 @@ function renderRoom() {
   $('room-timeline').value = String(t);
   $('room-revision-view').textContent = String(r.view.revision);
   updateRoomHandoverCountdown();
+  updateRoomProgramStatus(t);
   renderStageInto(r.session, t, $('room-stage'), $('room-levels'), $('room-cue-timeline'));
 }
+
+/* --------------------------- 循环排演 --------------------------- */
+// 主持人提交 1～8 段循环（{start,end,repeat}，携带密钥与修订号）；成功后服务端
+// 从首段开始播放。暂停/改速保留进度、继续从断点接续；手动跳转取消编排。观看者
+// 只读查看当前段/轮次/时码，看不到编辑器与密钥。
+
+function ensureProgRows(r) {
+  if (!r.progRows) r.progRows = [defaultProgRow()];
+  return r.progRows;
+}
+
+function renderRoomProgram() {
+  const r = state.room;
+  if (!r) return;
+  const isHost = !!r.key;
+  $('room-program-host').hidden = !isHost;
+  $('room-program-viewer').hidden = isHost;
+
+  if (isHost) {
+    const rows = ensureProgRows(r);
+    const tb = $('room-program-table').querySelector('tbody');
+    // 仅在结构缺失/段数变化时重建表格，避免每秒轮询打断主持人正在输入的焦点
+    if (tb.dataset.rows !== String(rows.length)) {
+      renderProgramEditorRows();
+    }
+  }
+  updateRoomProgramStatus(roomCurrentTime(Date.now() / 1000));
+}
+
+// 重建编排编辑器表格（进入房间/增删段时调用；轮询不重建以免抢走输入焦点）
+function renderProgramEditorRows() {
+  const r = state.room;
+  if (!r) return;
+  const rows = ensureProgRows(r);
+  const tb = $('room-program-table').querySelector('tbody');
+  tb.dataset.rows = String(rows.length);
+  tb.innerHTML = rows
+    .map(
+      (row, i) => `
+      <tr data-prog-row="${i}">
+        <td class="prog-idx">第 ${i + 1} 段</td>
+        <td><input data-prog="start" type="number" min="0" step="0.1" value="${row.start}" /></td>
+        <td><input data-prog="end" type="number" min="0" step="0.1" value="${row.end}" /></td>
+        <td><input data-prog="repeat" type="number" min="1" step="1" value="${row.repeat}" /></td>
+        <td>${rows.length > 1 ? '<button type="button" data-prog-del="' + i + '" class="danger">删除</button>' : ''}</td>
+      </tr>`
+    )
+    .join('');
+  tb.querySelectorAll('input[data-prog]').forEach((inp) => {
+    inp.addEventListener('input', (e) => {
+      const tr = e.target.closest('tr[data-prog-row]');
+      const idx = Number(tr.dataset.progRow);
+      const field = e.target.dataset.prog;
+      const val = e.target.value;
+      rows[idx][field] = val === '' ? '' : Number(val);
+    });
+  });
+  tb.querySelectorAll('button[data-prog-del]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const idx = Number(btn.dataset.progDel);
+      r.progRows.splice(idx, 1);
+      renderProgramEditorRows();
+    });
+  });
+}
+
+// 状态条：未编排 / 播放中（当前段·轮次·时码）/ 暂停 / 已走完；同时列出全部段并高亮当前段
+function updateRoomProgramStatus(time) {
+  const box = $('room-program-status');
+  const r = state.room;
+  if (!r || !box) return;
+  const p = r.view.program;
+  if (!p) {
+    box.className = 'room-program-status';
+    box.innerHTML = '<span class="rp-title">循环排演：未安排</span>当前为普通房间播放；主持人可在下方编排 1～8 段循环。';
+    return;
+  }
+  const segList = p.segments
+    .map((s, i) => {
+      const cur = !p.finished && i === p.segment_index - 1;
+      return `<span class="${cur ? 'cur' : ''}">${cur ? '▶ ' : ''}第 ${i + 1} 段 [${fmt(s.start)}–${fmt(s.end)}]×${s.repeat}</span>`;
+    })
+    .join('　');
+  let cls;
+  let head;
+  if (p.finished) {
+    cls = 'is-finished';
+    head = '✅ 循环排演已全部完成';
+  } else if (r.view.playing) {
+    cls = 'is-playing';
+    head = '🎬 循环排演播放中';
+  } else {
+    cls = 'is-paused';
+    head = '⏸ 循环排演已暂停（进度保留，继续从断点接续）';
+  }
+  box.className = `room-program-status ${cls}`;
+  box.innerHTML =
+    `<span class="rp-title">${head}</span>` +
+    `当前第 <b>${p.segment_index}</b>/${p.segment_count} 段 · 第 <b>${p.loop}</b>/${p.loop_total} 轮` +
+    ` · 时码 <b class="rp-time">${fmt(time)}</b> s` +
+    (p.finished ? '（停在末段终点；按播放从首段重新开始）' : '') +
+    `<div class="room-program-seg-list">${segList}</div>`;
+}
+
+$('btn-room-prog-add').addEventListener('click', () => {
+  const r = state.room;
+  if (!r) return;
+  const rows = ensureProgRows(r);
+  if (rows.length >= 8) return showErr($('room-program-error'), '最多 8 段。');
+  rows.push(defaultProgRow());
+  renderProgramEditorRows();
+});
+
+// 提交循环排演：携带控制密钥与当前修订号；成功后服务端从首段开始播放、修订号 +1
+$('btn-room-prog-submit').addEventListener('click', async () => {
+  const r = state.room;
+  if (!r) return;
+  if (!r.key) return showErr($('room-program-error'), '观看者不能编排：请先输入控制密钥。');
+  clearErr($('room-program-error'));
+  const rows = ensureProgRows(r);
+  if (rows.length < 1 || rows.length > 8) {
+    return showErr($('room-program-error'), '请编排 1～8 段。');
+  }
+  const segments = rows.map((row) => ({
+    start: Number(row.start),
+    end: Number(row.end),
+    repeat: Number(row.repeat),
+  }));
+  for (let i = 0; i < segments.length; i++) {
+    const s = segments[i];
+    if (!Number.isFinite(s.start) || s.start < 0 || !Number.isFinite(s.end) || s.end < 0 ||
+        !(s.start < s.end)) {
+      return showErr($('room-program-error'), `第 ${i + 1} 段非法：起点/终点须为非负数字，且起点严格早于终点。`);
+    }
+    if (s.end > r.view.duration) {
+      return showErr($('room-program-error'), `第 ${i + 1} 段终点 ${fmt(s.end)} 超过版本末尾 ${fmt(r.view.duration)} 秒。`);
+    }
+    if (!Number.isInteger(s.repeat) || s.repeat < 1) {
+      return showErr($('room-program-error'), `第 ${i + 1} 段重复次数须为正整数。`);
+    }
+  }
+  try {
+    const view = await api('POST', `/api/rooms/${encodeURIComponent(r.view.code)}/program`, {
+      control_key: r.key,
+      revision: r.view.revision,
+      segments,
+    });
+    r.view = view;
+    applyRoomAnchor(view);
+    renderRoomRole();
+    renderRoomProtection();
+    renderRoomHandover();
+    renderRoomProgram();
+  } catch (e) {
+    if (e.status === 409) await pollRoom();
+    else if (e.status === 403) {
+      r.key = null;
+      saveRoomKey(r.view.code, null);
+      $('room-key-input').value = '';
+      await pollRoom();
+      renderRoomRole();
+    }
+    renderRoomProgram();
+    showErr($('room-program-error'), `提交循环排演失败：${e.message}`);
+  }
+});
+
+// 取消当前编排：删除编排并沿用普通房间语义（播放状态与时码保留）
+$('btn-room-prog-cancel').addEventListener('click', async () => {
+  const r = state.room;
+  if (!r) return;
+  if (!r.key) return showErr($('room-program-error'), '观看者不能取消编排。');
+  if (!r.view.program) return showErr($('room-program-error'), '当前没有进行中的循环排演。');
+  clearErr($('room-program-error'));
+  try {
+    const view = await api('POST', `/api/rooms/${encodeURIComponent(r.view.code)}/program/clear`, {
+      control_key: r.key,
+      revision: r.view.revision,
+    });
+    r.view = view;
+    applyRoomAnchor(view);
+    renderRoomRole();
+    renderRoomProtection();
+    renderRoomHandover();
+    renderRoomProgram();
+  } catch (e) {
+    if (e.status === 409) await pollRoom();
+    renderRoomProgram();
+    showErr($('room-program-error'), `取消循环排演失败：${e.message}`);
+  }
+});
+
 
 // 回路超载保护状态条：未启用 / 已启用安全 / 当前已超载 / 已在边界自动暂停
 function renderRoomProtection() {

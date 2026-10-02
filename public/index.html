@@ -160,6 +160,44 @@
           <div id="room-error" class="error-line" hidden></div>
         </div>
 
+        <!-- 循环排演（主持人编排 1～8 段循环；观看者只读查看进度） -->
+        <div class="card" id="room-program-card">
+          <h2>循环排演</h2>
+          <p class="muted">
+            主持人可按本房间的<strong>固定演出版本</strong>编排 1～8 段循环：每段给出非负起止时码与正整数
+            重复次数（起点须早于终点且不超过版本末尾）。提交需携带控制密钥与当前修订号；成功后
+            <strong>从首段开始播放</strong>并递增修订号，段尾立即跳回本段起点或下段起点，全部完成后停在末段终点。
+            暂停与改速保留进度；<strong>手动跳转会取消编排</strong>回到普通房间。
+          </p>
+
+          <div id="room-program-status" class="room-program-status"></div>
+
+          <div id="room-program-host">
+            <div class="row">
+              <button type="button" id="btn-room-prog-add" class="secondary">＋ 添加一段</button>
+              <span class="muted">最多 8 段；按列出顺序依次播放。</span>
+            </div>
+            <div class="table-wrap">
+              <table id="room-program-table">
+                <thead>
+                  <tr><th>段</th><th>起点 (s)</th><th>终点 (s)</th><th>重复次数</th><th></th></tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <div class="row">
+              <button type="button" id="btn-room-prog-submit" class="primary">🎬 提交并从首段开始</button>
+              <button type="button" id="btn-room-prog-cancel">取消当前编排</button>
+              <span class="muted">提交即播放；重复次数极大也由服务端精确推算。</span>
+            </div>
+            <div id="room-program-error" class="error-line" hidden></div>
+          </div>
+
+          <div id="room-program-viewer" class="muted" hidden>
+            观看者只读：当前段、轮次与时码见上方状态条；编排控制仅持密钥者可用。
+          </div>
+        </div>
+
         <div class="card">
           <h2>舞台模拟（房间当前各灯实际亮度）</h2>
           <div id="room-stage" class="stage"></div>
@@ -558,6 +596,7 @@
   </main>
 
   <script src="/engine.js"></script>
+  <script src="/program.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

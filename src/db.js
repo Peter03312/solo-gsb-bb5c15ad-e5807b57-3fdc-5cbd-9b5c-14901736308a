@@ -157,6 +157,22 @@ CREATE TABLE IF NOT EXISTS room_handovers (
   expires_at REAL NOT NULL,                  -- 墙钟秒：Date.now()/1000 + 300（五分钟有效）
   created_at REAL NOT NULL
 );
+
+-- 共享房间循环排演编排：主持人按房间固定版本提交 1～8 段循环；提交成功后从首段
+-- 开始播放（rooms.playing=1）。编排的推进完全由 rooms 的基准时码 + 基准墙钟 +
+-- 速度驱动（与普通房间同一套墙钟推算），本表只保存“逻辑进度”：当前段、本段
+-- 已完成轮次与当前段内时码；段尾跳回/跳段是瞬时跳转、不耗墙钟。
+-- 行不存在（含从未编排、手动跳转取消、编排走完后）= 未编排房间，沿用原行为。
+-- 手动跳转（seek）删除本行并沿用原房间控制语义；编排全部走完把 finished 置 1
+-- （停在末段终点；此时播放会从首段重新开始整次编排）。
+CREATE TABLE IF NOT EXISTS room_programs (
+  room_id    INTEGER PRIMARY KEY REFERENCES rooms(id) ON DELETE CASCADE,
+  segments   TEXT NOT NULL,                  -- JSON：[{start,end,repeat}]，1～8 段，提交时校验
+  seg_index  INTEGER NOT NULL DEFAULT 0,     -- 当前段（0 基）
+  iteration  INTEGER NOT NULL DEFAULT 0,     -- 当前段已完成的重复轮次（0 基）
+  prog_time  REAL NOT NULL DEFAULT 0,        -- 当前段内（或段起点）演出时码
+  finished   INTEGER NOT NULL DEFAULT 0      -- 1 = 整次编排已全部走完，停在末段终点
+);
 `;
 
 let db;

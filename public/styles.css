@@ -299,3 +299,24 @@ tr.cmp-hot td { color: var(--amber-soft); }
 }
 .room-handover input { margin: .3rem 0; }
 .room-handover button { margin: .15rem .2rem .15rem 0; }
+
+/* 循环排演 */
+.room-program-status {
+  margin: .5rem 0 .8rem;
+  padding: .55rem .8rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(154, 148, 179, 0.06);
+  color: var(--muted);
+  min-height: 2.2rem;
+}
+.room-program-status.is-playing { color: var(--ok); border-color: var(--ok); background: rgba(76, 208, 125, 0.08); }
+.room-program-status.is-paused { color: var(--amber-soft); border-color: var(--amber); background: rgba(245, 185, 66, 0.10); }
+.room-program-status.is-finished { color: var(--amber-soft); border-color: var(--line); background: rgba(245, 185, 66, 0.08); }
+.room-program-status .rp-title { font-weight: 600; margin-right: .4rem; }
+.room-program-status b.rp-time { color: #f3f1ff; }
+#room-program-table input { width: 6.5rem; }
+#room-program-table td.prog-idx { color: var(--muted); }
+#room-program-host button { margin: .15rem .2rem .15rem 0; }
+.room-program-seg-list { margin-top: .35rem; font-size: .92em; }
+.room-program-seg-list .cur { color: #f3f1ff; font-weight: 600; }
