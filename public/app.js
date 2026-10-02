@@ -695,17 +695,24 @@ async function enterRoom(code, key, initialView) {
   renderRoom();
   renderRoomProtection();
   renderRoomHandover();
+  renderRoomProgram();
 
   document.querySelector('.tab[data-tab="room"]').click();
 }
 
 // 服务端状态 -> 本地推算锚点（校时基准）
 function applyRoomAnchor(view) {
+  const p = view.program;
   state.room.anchor = {
     wall: view.server_wall,
     time: view.server_time,
     speed: view.speed,
     playing: view.playing,
+    // 循环排演编排：携带预编译段序列与锚点虚拟坐标（无编排为 null，走普通节目轴推算）
+    prog: p
+      ? Engine.prepareProgram(p.segments.map((s) => ({ start: s.start, end: s.end, repeat: s.repeat })))
+      : null,
+    elapsed: p ? p.elapsed : 0,
   };
 }
 
@@ -713,6 +720,21 @@ function applyRoomAnchor(view) {
 function roomCurrentTime(nowSec) {
   const r = state.room;
   const a = r.anchor;
+  if (a.prog) {
+    // 循环排演编排：沿段序列/重复轮次映射到演出时码，段尾回环或跳入下段
+    if (!a.playing) return Math.min(a.time, r.view.duration);
+    let e = a.elapsed + Math.max(0, nowSec - a.wall) * a.speed;
+    e = Math.min(e, a.prog.total);
+    // 超载保护：两次同步之间也不越过沿编排路径的前方首个超载边界（服务端在该坐标自动暂停）
+    const pp = r.view.protection;
+    if (pp && pp.enabled && pp.next_trip &&
+        typeof pp.next_trip.program_elapsed === 'number' &&
+        pp.next_trip.program_elapsed <= a.prog.total &&
+        e > pp.next_trip.program_elapsed) {
+      e = pp.next_trip.program_elapsed;
+    }
+    return Engine.locateProgram(a.prog, e, false).time;
+  }
   if (!a.playing) return Math.min(a.time, r.view.duration);
   let t = a.time + Math.max(0, nowSec - a.wall) * a.speed;
   t = Math.min(t, r.view.duration);
@@ -754,6 +776,8 @@ async function pollRoom() {
     renderRoomProtection();
     renderRoomHandover();
     updateRoomHandoverCountdown();
+    // 编排表单正在填写时不要重渲染（避免丢失输入）；其余情况每秒刷新当前段/轮次
+    if (!document.getElementById('room-program-editor')) renderRoomProgram();
   } catch {
     /* 单次轮询失败不打断观看：下一周期重试 */
   }
@@ -779,6 +803,7 @@ $('btn-room-apply-key').addEventListener('click', () => {
   saveRoomKey(r.view.code, key);
   clearErr($('room-error'));
   renderRoomRole();
+  renderRoomProgram();
 });
 
 // 统一控制入口：携带当前修订号；服务端响应即新锚点。409 冲突时先校时再提示重试
@@ -800,6 +825,7 @@ async function roomControl(action, extra = {}) {
     renderRoomRole();
     renderRoomProtection();
     renderRoomHandover();
+    if (!document.getElementById('room-program-editor')) renderRoomProgram();
   } catch (err2) {
     if (err2.status === 409) {
       await pollRoom(); // 过期：按服务端最新状态校时后提示重试
@@ -814,6 +840,7 @@ async function roomControl(action, extra = {}) {
     }
     renderRoomRole();
     renderRoomHandover();
+    if (!document.getElementById('room-program-editor')) renderRoomProgram();
     showErr($('room-error'), `控制失败：${err2.message}`);
   }
 }
@@ -907,6 +934,193 @@ function renderRoomProtection() {
   box.innerHTML = html;
 }
 
+/* ------------------------- 循环排演编排 ------------------------- */
+// 主持人可按房间固定版本编排 1～8 段循环排演：每段 {起点, 终点, 重复次数}。
+// 提交后从首段起点开始播放；段尾立即跳回本段起点或下段起点，全部完成停在末段终点。
+// 暂停与改速保留进度；手动跳转取消编排。观看者只读，仅看到当前段/轮次/状态。
+const ROOM_PROGRAM_MAX_SEGMENTS = 8;
+
+async function submitRoomProgram(segments) {
+  const r = state.room;
+  if (!r || !r.key) return showErr($('room-error'), '观看者不能编排循环排演：请先在上方输入控制密钥。');
+  clearErr($('room-error'));
+  try {
+    const view = await api('POST', `/api/rooms/${encodeURIComponent(r.view.code)}/program`, {
+      control_key: r.key,
+      revision: r.view.revision,
+      segments,
+    });
+    r.view = view;
+    applyRoomAnchor(view);
+    $('room-speed').value = String(view.speed);
+    renderRoomRole();
+    renderRoomProtection();
+    renderRoomHandover();
+    renderRoomProgram(true);
+  } catch (err2) {
+    if (err2.status === 409) {
+      await pollRoom(); // 过期：按服务端最新状态校时后提示重试
+    } else if (err2.status === 403) {
+      // 密钥已失效（主持权已交给他人）：本浏览器降级为观看者
+      r.key = null;
+      saveRoomKey(r.view.code, null);
+      $('room-key-input').value = '';
+      await pollRoom();
+    }
+    renderRoomRole();
+    renderRoomHandover();
+    renderRoomProgram();
+    showErr($('room-error'), `编排提交失败：${err2.message}`);
+  }
+}
+
+// 读取编排表里的段（返回 {segments} 或 {error}）
+function readProgramForm() {
+  const rows = document.querySelectorAll('#room-program-editor .rp-row');
+  const segments = [];
+  let n = 0;
+  for (const rowEl of rows) {
+    const startRaw = rowEl.querySelector('.rp-start').value.trim();
+    const endRaw = rowEl.querySelector('.rp-end').value.trim();
+    const repRaw = rowEl.querySelector('.rp-repeat').value.trim();
+    if (startRaw === '' && endRaw === '' && repRaw === '') continue; // 空行忽略
+    n++;
+    const start = Number(startRaw);
+    const end = Number(endRaw);
+    const repeat = Number(repRaw);
+    if (!Number.isFinite(start) || start < 0) return { error: `第 ${n} 段起点须为非负数字秒数` };
+    if (!Number.isFinite(end) || end < 0) return { error: `第 ${n} 段终点须为非负数字秒数` };
+    if (!(start < end)) return { error: `第 ${n} 段起点须早于终点` };
+    if (!Number.isInteger(repeat) || repeat < 1) return { error: `第 ${n} 段重复次数须为正整数` };
+    segments.push({ start, end, repeat });
+  }
+  if (segments.length === 0) return { error: '请至少填写一段（起点、终点、重复次数）' };
+  return { segments };
+}
+
+function programStatusText(status) {
+  if (status === 'playing') return '<span class="badge fading">编排播放中</span>';
+  if (status === 'paused') return '<span class="badge waiting">编排已暂停（进度保留）</span>';
+  return '<span class="badge done">编排已完成（停在末段终点）</span>';
+}
+
+// 编排状态条 + 主持人编排表单。resetForm=true 时（成功提交后）折叠为状态条
+function renderRoomProgram(resetForm) {
+  const r = state.room;
+  const box = $('room-program');
+  if (!r) {
+    box.hidden = true;
+    box.innerHTML = '';
+    box.className = '';
+    return;
+  }
+  const isHost = !!r.key;
+  const p = r.view.program;
+  const duration = r.view.duration;
+  box.hidden = false;
+  box.className = 'room-program card-sub';
+
+  let html = '';
+
+  if (p) {
+    // 段总表（主持与观看都可见）
+    const segRows = p.segments
+      .map(
+        (s) =>
+          `<tr class="${p.segment === s.index && p.status !== 'finished' ? 'rp-current' : ''}">` +
+          `<td>#${s.index}</td><td>${fmt(s.start)}</td><td>${fmt(s.end)}</td>` +
+          `<td>×${s.repeat}</td><td>${fmt(s.end - s.start)}</td></tr>`
+      )
+      .join('');
+    html +=
+      '<div class="rp-headline"><span class="rp-title">🔁 循环排演编排</span>' +
+      programStatusText(p.status) +
+      ` 当前 <b>第 ${p.segment}/${p.segment_count} 段 · 第 ${p.round}/${p.rounds_total} 轮</b>` +
+      ` · 段内时码 <b>${fmt(p.time)}</b> s · 编排进度 <b>${fmt(p.elapsed)}</b>/${fmt(p.total_elapsed)} s</div>` +
+      '<div class="table-wrap rp-table"><table><thead><tr>' +
+      '<th>段</th><th>起点 (s)</th><th>终点 (s)</th><th>重复</th><th>段长 (s)</th>' +
+      '</tr></thead><tbody>' +
+      segRows +
+      '</tbody></table></div>';
+    if (p.status === 'finished') {
+      html += '<p class="muted">整次编排已全部完成，停在末段终点；再按 ▶ 播放会从首段重新开始整次编排。手动跳转会取消编排。</p>';
+    } else {
+      html += '<p class="muted">段尾立即跳回本段起点（重复）或下段起点；暂停 / 改速保留进度；手动跳转将取消编排并沿用普通房间控制。</p>';
+    }
+    if (isHost) {
+      html += '<div class="row"><button type="button" id="btn-room-program-edit" class="ghost">重新编排（替换当前编排）</button></div>';
+    }
+  }
+
+  // 主持人编排表单（无编排、或点击“重新编排”后显示）
+  if (isHost && (!p || resetForm === 'edit')) {
+    const rows = p && resetForm === 'edit'
+      ? p.segments
+      : [{ start: '', end: '', repeat: 1 }];
+    html +=
+      '<div class="rp-editor" id="room-program-editor">' +
+      '<div class="rp-title">编排循环排演（按房间固定版本，末尾 ' + fmt(duration) + ' s）</div>' +
+      '<p class="muted">1～8 段，每段填写非负起点 / 终点（起点须早于终点且不超过版本末尾）与正整数重复次数；' +
+      '提交需携带当前修订号，成功后从首段起点开始播放并递增修订号。' +
+      (r.view.protection && r.view.protection.enabled
+        ? '<br><strong>已启用回路超载保护：任一段起点处于超载区间时，整次编排会被拒绝；运行途中抵达超载边界仍自动暂停，不越过危险段。</strong>'
+        : '') +
+      '</p>' +
+      '<div class="table-wrap"><table><thead><tr><th>段</th><th>起点 (s)</th><th>终点 (s)</th><th>重复次数</th></tr></thead><tbody>' +
+      rows
+        .map(
+          (s, i) =>
+            `<tr class="rp-row"><td>#${i + 1}</td>` +
+            `<td><input class="rp-start" type="number" min="0" step="0.1" value="${s.start}" style="width:6rem"></td>` +
+            `<td><input class="rp-end" type="number" min="0" step="0.1" value="${s.end}" style="width:6rem"></td>` +
+            `<td><input class="rp-repeat" type="number" min="1" step="1" value="${s.repeat}" style="width:5rem"></td></tr>`
+        )
+        .join('') +
+      '</tbody></table></div>' +
+      '<div class="row">' +
+      `<button type="button" id="btn-room-program-add" class="ghost" ${rows.length >= ROOM_PROGRAM_MAX_SEGMENTS ? 'disabled' : ''}>＋ 增加一段</button>` +
+      '<button type="button" id="btn-room-program-submit" class="primary">提交并从首段开始排演</button>' +
+      (p ? '<button type="button" id="btn-room-program-cancel-edit" class="ghost">收起</button>' : '') +
+      '</div></div>';
+  } else if (isHost && !p) {
+    html +=
+      '<div class="row"><button type="button" id="btn-room-program-edit" class="ghost">编排循环排演（1～8 段循环）</button></div>';
+  }
+  if (!isHost && !p) {
+    html += '<p class="muted">循环排演编排由持密钥的主持人发起；发起后观看者可在此查看当前段、轮次与状态。</p>';
+  }
+
+  box.innerHTML = html;
+
+  // 本帧按钮绑定（每次重渲染重建）
+  const bind = (id, fn) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('click', fn);
+  };
+  bind('btn-room-program-edit', () => renderRoomProgram('edit'));
+  bind('btn-room-program-cancel-edit', () => renderRoomProgram());
+  bind('btn-room-program-add', () => {
+    const tbody = document.querySelector('#room-program-editor tbody');
+    const i = tbody.querySelectorAll('tr').length;
+    if (i >= ROOM_PROGRAM_MAX_SEGMENTS) return;
+    const tr = document.createElement('tr');
+    tr.className = 'rp-row';
+    tr.innerHTML =
+      `<td>#${i + 1}</td>` +
+      '<td><input class="rp-start" type="number" min="0" step="0.1" style="width:6rem"></td>' +
+      '<td><input class="rp-end" type="number" min="0" step="0.1" style="width:6rem"></td>' +
+      '<td><input class="rp-repeat" type="number" min="1" step="1" value="1" style="width:5rem"></td>';
+    tbody.appendChild(tr);
+    document.getElementById('btn-room-program-add').disabled =
+      tbody.querySelectorAll('tr').length >= ROOM_PROGRAM_MAX_SEGMENTS;
+  });
+  bind('btn-room-program-submit', () => {
+    const got = readProgramForm();
+    if (got.error) return showErr($('room-error'), got.error);
+    submitRoomProgram(got.segments);
+  });
+}
+
 /* --------------------------- 主持权交接 --------------------------- */
 // 当前主持人可发起交接：取得仅显示一次、五分钟有效的一次性凭证；同一房间同时
 // 只有一份待领取凭证（再次发起使旧凭证失效）。接班人凭房间码与凭证领取新的
@@ -970,6 +1184,7 @@ async function claimRoomHandover(token) {
     $('room-key-input').value = d.control_key;
     renderRoomRole();
     renderRoomHandover();
+    renderRoomProgram();
   } catch (err2) {
     if (err2.status === 409) await pollRoom();
     showErr($('room-error'), `领取失败：${err2.message}`);

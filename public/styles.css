@@ -273,6 +273,24 @@ tr.cmp-hot td { color: var(--amber-soft); }
 .room-protection.is-warn { color: var(--danger); border-color: var(--danger); background: rgba(255, 107, 107, 0.10); }
 .room-protection.is-tripped { color: var(--amber-soft); border-color: var(--amber); background: rgba(245, 185, 66, 0.12); }
 
+/* 循环排演编排面板 */
+.room-program {
+  margin: .5rem 0;
+  padding: .55rem .8rem;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: rgba(154, 148, 179, 0.06);
+  font-size: .84rem;
+  line-height: 1.5;
+}
+.room-program .rp-title { font-weight: 600; margin-right: .4rem; }
+.room-program .rp-headline { margin: .2rem 0 .4rem; }
+.room-program .rp-table { margin: .35rem 0; max-width: 34rem; }
+.room-program table { font-size: .82rem; }
+.room-program tr.rp-current td { background: rgba(245, 185, 66, 0.14); font-weight: 600; }
+.room-program .rp-editor { margin-top: .5rem; padding-top: .5rem; border-top: 1px dashed var(--line); }
+.room-program button.ghost { font-size: .8rem; }
+
 /* 房间内的主持权交接状态条 */
 .room-handover {
   margin: .5rem 0;

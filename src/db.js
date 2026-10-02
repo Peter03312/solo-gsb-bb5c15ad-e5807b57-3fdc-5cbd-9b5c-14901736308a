@@ -140,6 +140,14 @@ CREATE TABLE IF NOT EXISTS rooms (
   -- 惰性落库与末尾停住一样不增加控制修订号；服务重启后据此恢复保护状态。
   tripped_circuit_id INTEGER,
   tripped_time       REAL,
+  -- 循环排演编排：主持人按固定版本编排 1～8 段 {start,end,repeat}（见 server 校验）。
+  -- program_json 非 NULL 表示房间当前在编：播放沿段序列推进，段尾跳回本段起点或
+  -- 下段起点，全部完成停在末段终点；NULL 表示普通播放（既有行为）。
+  -- program_e 为最近一次控制时的“编排虚拟坐标”（= 墙钟流逝 × 速度的累计编排时长），
+  -- 与 time/anchor_wall 同为基准：服务端按 program_e +(now-anchor_wall)*speed 推算。
+  -- 手动跳转（seek）取消编排（program_json 置 NULL）；暂停/改速保留进度。
+  program_json TEXT,
+  program_e    REAL NOT NULL DEFAULT 0,
   created_at  REAL NOT NULL
 );
 
@@ -182,6 +190,17 @@ function migrate(database) {
     }
     if (!roomCols.includes('tripped_time')) {
       database.exec('ALTER TABLE rooms ADD COLUMN tripped_time REAL');
+    }
+  }
+
+  // 循环排演编排：旧库补列（既有房间默认未编排，沿用原行为）
+  const roomCols2 = database.prepare('PRAGMA table_info(rooms)').all().map((c) => c.name);
+  if (roomCols2.length > 0) {
+    if (!roomCols2.includes('program_json')) {
+      database.exec('ALTER TABLE rooms ADD COLUMN program_json TEXT');
+    }
+    if (!roomCols2.includes('program_e')) {
+      database.exec('ALTER TABLE rooms ADD COLUMN program_e REAL NOT NULL DEFAULT 0');
     }
   }
 }

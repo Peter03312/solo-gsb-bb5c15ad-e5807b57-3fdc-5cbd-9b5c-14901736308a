@@ -569,6 +569,145 @@
     return load;
   }
 
+  /* --------------------- 循环排演编排（段序列 × 重复次数） --------------------- */
+  //
+  // 主持人可按房间固定版本编排 1～8 段循环排演：每段 {start, end, repeat}，
+  // start < end，播放从首段起点开始，段尾立即跳回本段起点（重复 repeat 次）或
+  // 跳到下段起点，全部完成后停在末段终点。用“编排虚拟流逝坐标 e”（= 墙钟流逝 ×
+  // 速度，与内容时码解耦）描述播放位置，回环跳跃不产生墙钟空洞：
+  //
+  //   段 i 一次播放长度 len_i = end_i - start_i，共占 repeat_i × len_i 的虚拟时长；
+  //   cumStart_i/cumEnd_i 为其在整场编排中的虚拟起止偏移。
+  //
+  // 下列纯函数浏览器（观看端本地推算）与 Node（服务端墙钟推算）共用，保证两端一致。
+
+  const PROGRAM_EPS = 1e-9;
+
+  /**
+   * 预编译编排：校验与派生字段由调用方（服务端）完成，这里只做数值展开。
+   * 输入 segments: [{start, end, repeat}]，输出 {segments, total}，
+   * 每段附加 len / cumStart / cumEnd。
+   */
+  function prepareProgram(segments) {
+    const segs = segments.map((s) => {
+      const start = Number(s.start);
+      const end = Number(s.end);
+      const repeat = Number(s.repeat);
+      return {
+        start,
+        end,
+        repeat,
+        len: end - start,
+        cumStart: 0,
+        cumEnd: 0,
+      };
+    });
+    let cursor = 0;
+    for (const s of segs) {
+      s.cumStart = cursor;
+      cursor += s.len * s.repeat;
+      s.cumEnd = cursor;
+    }
+    return { segments: segs, total: cursor };
+  }
+
+  /**
+   * 虚拟坐标 e -> 编排内位置 {i, k, time, finished, elapsed}：
+   *  - i：段下标（0 起）；k：本轮段内重复轮次下标（0 起）；time：当前演出时码。
+   *  - 半开区间 [playStart, playEnd) 归属“正在播放的那一轮”，故段尾瞬间即跳到下一轮/下段。
+   *  - fromLeft：e 恰好等于某轮右端点（超载闭端点触发冻结）时，把身份归给刚结束的那一轮，
+   *    时码两种取法相同（都是该段终点），仅段/轮展示与延续判定用。
+   */
+  function locateProgram(prog, e, fromLeft = false) {
+    if (!prog || prog.segments.length === 0) return null;
+    const total = prog.total;
+    let ex = Number(e);
+    if (!Number.isFinite(ex)) ex = 0;
+    ex = Math.max(0, Math.min(ex, total));
+
+    if (ex >= total - PROGRAM_EPS) {
+      const last = prog.segments[prog.segments.length - 1];
+      return {
+        finished: true,
+        i: prog.segments.length - 1,
+        k: last.repeat - 1,
+        time: last.end,
+        elapsed: total,
+      };
+    }
+
+    let i = prog.segments.findIndex((s) =>
+      fromLeft ? ex <= s.cumEnd + PROGRAM_EPS && ex >= s.cumStart - PROGRAM_EPS : ex < s.cumEnd
+    );
+    if (i < 0) i = prog.segments.length - 1;
+    const seg = prog.segments[i];
+    const u = ex - seg.cumStart;
+    let k = Math.floor(u / seg.len + PROGRAM_EPS);
+    k = Math.max(0, Math.min(k, seg.repeat - 1));
+    // 恰好落在某轮右端点且要求归左：身份属于刚结束的上一轮（闭端点段尾触发冻结时用）。
+    // 半开归属下方先取到的是“刚跳入的下一轮”，这里退一轮；时码恒为段终点（冻结边界）。
+    const atRight =
+      Math.abs(u - (k + 1) * seg.len) <= PROGRAM_EPS && k + 1 <= seg.repeat;
+    if (fromLeft && k > 0 && Math.abs(u - k * seg.len) <= PROGRAM_EPS) k -= 1;
+    let into = u - k * seg.len;
+    if (fromLeft) into = atRight ? seg.len : (Math.abs(into) <= PROGRAM_EPS ? 0 : into);
+    into = Math.max(0, Math.min(into, seg.len));
+    return {
+      finished: false,
+      i,
+      k,
+      time: seg.start + into,
+      elapsed: ex,
+    };
+  }
+
+  /**
+   * 沿编排播放路径，找从虚拟坐标 e0 推进时撞上的“最早一个”超载区间左边界。
+   *
+   * boundaries 为内容时码上的超载左边界（任意顺序），每项至少
+   *   {start: 内容时码, inclusive: 该左边界是否闭端点（触发瞬间本身即超载）}，
+   * 其余字段（如回路信息）原样随结果返回，供调用方展示。
+   *
+   * 段尾回环/跳入下段的跳跃规则：
+   *  - 边界严格位于段内：该轮播放抵达即撞上（开端点在锚点上时，墙钟一旦推进即冻结）；
+   *  - 边界恰为段【起点】：每轮（含首轮开始与回环跳入）一旦向前推进即进入危险段，
+   *    冻结在起点（编排提交时闭端点起点已被整次拒绝，这里按通用规则处理）；
+   *  - 边界恰为段【终点】且为闭端点：抵达该瞬间本身超载，冻结在段尾（不回环/不跳入下段）；
+   *  - 边界恰为段终点且为开端点：该瞬间负载恰等于容量（安全），而路径在段尾立即跳走、
+   *    绝不进入其后的危险段，故不算撞上（末段终点则正常收尾）。
+   *
+   * 返回 {at: 撞上时的虚拟坐标, boundary, atPlayEnd} 或 null。
+   */
+  function programNextTrip(prog, boundaries, e0) {
+    if (!prog || prog.segments.length === 0) return null;
+    const E = Math.max(0, Math.min(Number(e0) || 0, prog.total));
+    if (E >= prog.total - PROGRAM_EPS) return null;
+
+    let best = null;
+    const consider = (at, b, atPlayEnd) => {
+      if (at + PROGRAM_EPS < E) return;
+      const val = at <= E + PROGRAM_EPS ? E : at; // 锚点就在边界上：推进即冻结
+      if (!best || val < best.at - PROGRAM_EPS) best = { at: val, boundary: b, atPlayEnd: !!atPlayEnd };
+    };
+
+    for (const seg of prog.segments) {
+      for (const b of boundaries) {
+        if (b.start < seg.start - PROGRAM_EPS || b.start > seg.end + PROGRAM_EPS) continue;
+        const atEnd = Math.abs(b.start - seg.end) <= PROGRAM_EPS;
+        if (atEnd && !b.inclusive) continue; // 开端点段尾：回环/收尾瞬间立即跳走，不进入危险段
+
+        // 第 k 轮抵达该边界的虚拟坐标 e_k = cumStart + k*len + (b.start - start)，
+        // 取首个不早于 E 的轮次（避免按重复次数线性展开）。
+        let k = Math.ceil((E - seg.cumStart - (b.start - seg.start)) / seg.len - PROGRAM_EPS);
+        k = Math.max(0, Math.min(k, seg.repeat - 1));
+        const at = seg.cumStart + k * seg.len + (b.start - seg.start);
+        if (at + PROGRAM_EPS < E) continue; // 所有轮次都已在身后
+        consider(at, b, atEnd);
+      }
+    }
+    return best;
+  }
+
   return {
     clamp,
     prepareCues,
@@ -583,5 +722,8 @@
     brightnessPolyAt,
     circuitOverloadIntervals,
     circuitLoadAt,
+    prepareProgram,
+    locateProgram,
+    programNextTrip,
   };
 });
